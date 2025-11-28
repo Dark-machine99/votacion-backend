@@ -1,3 +1,4 @@
+// index.js (backend)
 import express from "express";
 import cors from "cors";
 import bcrypt from "bcryptjs";
@@ -10,22 +11,22 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "supersecreto";
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:5173";
 
-// ================================================
-//                   MIDDLEWARES
-// ================================================
+// ==============================
+//           MIDDLEWARES
+// ==============================
 app.use(
   cors({
-    origin: "http://localhost:5173",
+    origin: CORS_ORIGIN,
     credentials: true,
   })
 );
-
 app.use(express.json());
 
-// ================================================
-//                   HELPERS
-// ================================================
+// ==============================
+//            HELPERS
+// ==============================
 function createToken(user) {
   return jwt.sign(
     { id: user.id, role: user.role, name: user.name, email: user.email },
@@ -36,11 +37,9 @@ function createToken(user) {
 
 function authRequired(req, res, next) {
   const authHeader = req.headers.authorization;
-  if (!authHeader)
-    return res.status(401).json({ message: "Token requerido" });
+  if (!authHeader) return res.status(401).json({ message: "Token requerido" });
 
   const token = authHeader.split(" ")[1];
-
   try {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
@@ -67,11 +66,15 @@ async function logAudit(userId, action, description) {
   }
 }
 
-// ================================================
-//                       RUTAS
-// ================================================
-app.get("/", (req, res) => {
+// ==============================
+//             RUTAS
+// ==============================
+app.get("/", (_req, res) => {
   res.json({ message: "API Sistema de Votación funcionando" });
+});
+
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString() });
 });
 
 /* =====================================================
@@ -80,7 +83,9 @@ app.get("/", (req, res) => {
 
 // LOGIN
 app.post("/api/auth/login", async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password } = req.body || {};
+  if (!email || !password)
+    return res.status(400).json({ message: "Email y contraseña requeridos" });
 
   try {
     const [rows] = await pool.query(
@@ -94,6 +99,9 @@ app.post("/api/auth/login", async (req, res) => {
 
     if (!user.active)
       return res.status(403).json({ message: "Usuario inactivo" });
+
+    if (!user.password_hash)
+      return res.status(400).json({ message: "Usuario inválido" });
 
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match)
@@ -114,25 +122,22 @@ app.post("/api/auth/login", async (req, res) => {
 
 // REGISTRO VOTANTE
 app.post("/api/auth/register", async (req, res) => {
-  const { name, email, password } = req.body;
+  const { name, email, password } = req.body || {};
+  if (!name || !email || !password)
+    return res.status(400).json({ message: "Nombre, email y contraseña requeridos" });
 
   try {
-    const [exist] = await pool.query(
-      "SELECT id FROM users WHERE email = ? LIMIT 1",
-      [email]
-    );
+    const [exist] = await pool.query("SELECT id FROM users WHERE email = ? LIMIT 1", [email]);
     if (exist.length > 0)
       return res.status(400).json({ message: "El correo ya está registrado" });
 
     const hash = await bcrypt.hash(password, 12);
-
     const [result] = await pool.query(
       "INSERT INTO users (name, email, password_hash, role, active, created_at) VALUES (?, ?, ?, 'voter', 1, NOW())",
       [name, email, hash]
     );
 
     await logAudit(result.insertId, "USUARIO_CREADO", `Nuevo votante: ${email}`);
-
     res.json({ message: "Usuario creado correctamente" });
   } catch (err) {
     console.error("Error registrando usuario:", err);
@@ -142,25 +147,22 @@ app.post("/api/auth/register", async (req, res) => {
 
 // CREAR ADMIN
 app.post("/api/admin/create-admin", authRequired, adminOnly, async (req, res) => {
-  const { name, email, password } = req.body;
+  const { name, email, password } = req.body || {};
+  if (!name || !email || !password)
+    return res.status(400).json({ message: "Nombre, email y contraseña requeridos" });
 
   try {
-    const [exist] = await pool.query(
-      "SELECT id FROM users WHERE email = ? LIMIT 1",
-      [email]
-    );
+    const [exist] = await pool.query("SELECT id FROM users WHERE email = ? LIMIT 1", [email]);
     if (exist.length > 0)
       return res.status(400).json({ message: "El correo ya existe" });
 
     const hash = await bcrypt.hash(password, 12);
-
     const [result] = await pool.query(
       "INSERT INTO users (name, email, password_hash, role, active, created_at) VALUES (?, ?, ?, 'admin', 1, NOW())",
       [name, email, hash]
     );
 
     await logAudit(req.user.id, "ADMIN_CREADO", `Admin creado: ${email}`);
-
     res.json({ message: "Administrador creado", id: result.insertId });
   } catch (err) {
     console.error("Error creando admin:", err);
@@ -169,7 +171,7 @@ app.post("/api/admin/create-admin", authRequired, adminOnly, async (req, res) =>
 });
 
 /* =====================================================
-                    VOTANTE
+                      VOTANTE
 ===================================================== */
 
 // LISTA DE ELECCIONES
@@ -177,53 +179,55 @@ app.get("/api/voter/elections", authRequired, async (_req, res) => {
   try {
     const [rows] = await pool.query(
       `SELECT id, title, description, start_date, end_date, status 
-       FROM elections ORDER BY start_date ASC`
+       FROM elections 
+       ORDER BY start_date ASC`
     );
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    console.error("Error obteniendo elecciones:", err);
     res.status(500).json({ message: "Error en el servidor" });
   }
 });
 
-// DETALLE ELECCIÓN
+// DETALLE ELECCIÓN + CANDIDATOS
 app.get("/api/voter/elections/:id", authRequired, async (req, res) => {
   const { id } = req.params;
-
   try {
-    const [[election]] = await pool.query(
-      "SELECT * FROM elections WHERE id = ?",
-      [id]
-    );
-
-    if (!election)
-      return res.status(404).json({ message: "Elección no encontrada" });
+    const [[election]] = await pool.query("SELECT * FROM elections WHERE id = ?", [id]);
+    if (!election) return res.status(404).json({ message: "Elección no encontrada" });
 
     const [candidates] = await pool.query(
-      "SELECT * FROM candidates WHERE election_id = ?",
+      "SELECT * FROM candidates WHERE election_id = ? ORDER BY created_at DESC",
       [id]
     );
 
     res.json({ election, candidates });
   } catch (err) {
-    console.error(err);
+    console.error("Error obteniendo elección:", err);
     res.status(500).json({ message: "Error en el servidor" });
   }
 });
 
-// VOTAR
+// VOTAR (solo si la elección está Activa)
 app.post("/api/voter/elections/:id/vote", authRequired, async (req, res) => {
-  const { id } = req.params;          // election_id
-  const { candidateId } = req.body;
+  const { id } = req.params; // election_id
+  const { candidateId } = req.body || {};
   const userId = req.user.id;
 
+  if (!candidateId) return res.status(400).json({ message: "Candidato requerido" });
+
   try {
+    // Validar estado de elección
+    const [[election]] = await pool.query("SELECT status FROM elections WHERE id = ?", [id]);
+    if (!election) return res.status(404).json({ message: "Elección no encontrada" });
+    if (election.status !== "Activa")
+      return res.status(400).json({ message: "Esta elección no está activa" });
+
     // Evitar doble voto
     const [exists] = await pool.query(
       "SELECT id FROM votes WHERE user_id = ? AND election_id = ?",
       [userId, id]
     );
-
     if (exists.length > 0)
       return res.status(400).json({ message: "Ya votaste en esta elección" });
 
@@ -233,22 +237,19 @@ app.post("/api/voter/elections/:id/vote", authRequired, async (req, res) => {
     );
 
     await logAudit(userId, "VOTO_EMITIDO", `Voto en elección ${id}`);
-
     res.json({ message: "Voto registrado correctamente" });
   } catch (err) {
-    console.error(err);
+    console.error("Error registrando voto:", err);
     res.status(500).json({ message: "Error en el servidor" });
   }
 });
 
-// HISTORIAL
+// HISTORIAL DEL VOTANTE
 app.get("/api/voter/history", authRequired, async (req, res) => {
   const userId = req.user.id;
-
   try {
     const [rows] = await pool.query(
-      `SELECT 
-        v.id, e.title, e.description, v.created_at, c.name AS candidate
+      `SELECT v.id, e.title, e.description, v.created_at, c.name AS candidate
        FROM votes v
        JOIN elections e ON v.election_id = e.id
        JOIN candidates c ON v.candidate_id = c.id
@@ -256,10 +257,22 @@ app.get("/api/voter/history", authRequired, async (req, res) => {
        ORDER BY v.created_at DESC`,
       [userId]
     );
-
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    console.error("Error obteniendo historial:", err);
+    res.status(500).json({ message: "Error en el servidor" });
+  }
+});
+
+// LUGARES DE VOTACIÓN (faltaba para el front)
+app.get("/api/voter/places", authRequired, async (_req, res) => {
+  try {
+    const [rows] = await pool.query(
+      "SELECT id, name, address, capacity FROM polling_places ORDER BY created_at DESC"
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error("Error obteniendo lugares:", err);
     res.status(500).json({ message: "Error en el servidor" });
   }
 });
@@ -271,27 +284,40 @@ app.get("/api/voter/history", authRequired, async (req, res) => {
 // DASHBOARD
 app.get("/api/admin/dashboard", authRequired, adminOnly, async (_req, res) => {
   try {
-    const [[users]] = await pool.query("SELECT COUNT(*) AS total_users FROM users");
-    const [[elections]] = await pool.query("SELECT COUNT(*) AS total_elections FROM elections");
-    const [[votes]] = await pool.query("SELECT COUNT(*) AS total_votes FROM votes");
-
-    const [[participation]] = await pool.query(
-      `SELECT 
-       (SELECT COUNT(DISTINCT user_id) FROM votes) /
-       GREATEST((SELECT COUNT(*) FROM users WHERE role='voter'),1) * 100 AS participation`
+    const [[usersCount]] = await pool.query(
+      "SELECT COUNT(*) AS total_users FROM users"
+    );
+    const [[electionsCount]] = await pool.query(
+      "SELECT COUNT(*) AS total_elections FROM elections"
+    );
+    const [[votesCount]] = await pool.query(
+      "SELECT COUNT(*) AS total_votes FROM votes"
     );
 
+    const [[votersCount]] = await pool.query(
+      "SELECT COUNT(*) AS voters FROM users WHERE role = 'voter'"
+    );
+    const [[distinctVoters]] = await pool.query(
+      "SELECT COUNT(DISTINCT user_id) AS voters_voted FROM votes"
+    );
+
+    const participation =
+      votersCount.voters > 0
+        ? Number(((distinctVoters.voters_voted / votersCount.voters) * 100).toFixed(2))
+        : 0;
+
     res.json({
-      totalUsers: users.total_users,
-      totalElections: elections.total_elections,
-      totalVotes: votes.total_votes,
-      participation: participation.participation || 0,
+      totalUsers: usersCount.total_users,
+      totalElections: electionsCount.total_elections,
+      totalVotes: votesCount.total_votes,
+      participation, // <- número real, no string
     });
   } catch (err) {
-    console.error(err);
+    console.error("Error en dashboard admin:", err);
     res.status(500).json({ message: "Error en el servidor" });
   }
 });
+
 
 // LISTAR ELECCIONES
 app.get("/api/admin/elections", authRequired, adminOnly, async (_req, res) => {
@@ -299,14 +325,21 @@ app.get("/api/admin/elections", authRequired, adminOnly, async (_req, res) => {
     const [rows] = await pool.query("SELECT * FROM elections ORDER BY start_date DESC");
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    console.error("Error obteniendo elecciones:", err);
+    res.status(500).json({ message: "Error en el servidor" });
   }
 });
 
-// CREAR ELECCIÓN
+// CREAR ELECCIÓN (acepta start_date|startDate)
 app.post("/api/admin/elections/create", authRequired, adminOnly, async (req, res) => {
   try {
-    const { title, description, start_date, end_date, status } = req.body;
+    const { title, description } = req.body || {};
+    const start_date = req.body.start_date || req.body.startDate;
+    const end_date = req.body.end_date || req.body.endDate;
+    const status = req.body.status || "Programada";
+
+    if (!title || !start_date || !end_date)
+      return res.status(400).json({ message: "Título y fechas requeridos" });
 
     const allowed = ["Activa", "Programada", "Finalizada"];
     if (!allowed.includes(status))
@@ -314,46 +347,48 @@ app.post("/api/admin/elections/create", authRequired, adminOnly, async (req, res
 
     const [result] = await pool.query(
       "INSERT INTO elections (title, description, start_date, end_date, status, created_at) VALUES (?, ?, ?, ?, ?, NOW())",
-      [title, description, start_date, end_date, status]
+      [title, description || null, start_date, end_date, status]
     );
 
-    await logAudit(req.user.id, "ELECTION_CREATE", `Elección ${title}`);
-
+    await logAudit(req.user.id, "ELECTION_CREATE", `Elección ${title} (#${result.insertId})`);
     res.status(201).json({ id: result.insertId });
   } catch (err) {
-    console.error(err);
+    console.error("Error creando elección:", err);
     res.status(500).json({ message: "Error en el servidor" });
   }
 });
 
-// COMPATIBILIDAD
+// COMPAT: POST /api/admin/elections → redirige a /create
 app.post("/api/admin/elections", authRequired, adminOnly, (req, res, next) => {
   req.url = "/api/admin/elections/create";
   next();
 });
 
-// EDITAR ELECCIÓN
+// EDITAR ELECCIÓN (acepta start_date|startDate)
 app.put("/api/admin/elections/update/:id", authRequired, adminOnly, async (req, res) => {
   const { id } = req.params;
-
-  const { title, description, start_date, end_date, status } = req.body;
-
-  const allowed = ["Activa", "Programada", "Finalizada"];
-
-  if (status && !allowed.includes(status))
-    return res.status(400).json({ message: "Estado inválido" });
-
   try {
+    const { title, description } = req.body || {};
+    const start_date = req.body.start_date || req.body.startDate;
+    const end_date = req.body.end_date || req.body.endDate;
+    const status = req.body.status;
+
+    if (!title || !start_date || !end_date)
+      return res.status(400).json({ message: "Título y fechas requeridos" });
+
+    const allowed = ["Activa", "Programada", "Finalizada"];
+    if (status && !allowed.includes(status))
+      return res.status(400).json({ message: "Estado inválido" });
+
     await pool.query(
       "UPDATE elections SET title=?, description=?, start_date=?, end_date=?, status=? WHERE id=?",
-      [title, description, start_date, end_date, status, id]
+      [title, description || null, start_date, end_date, status || "Programada", id]
     );
 
     await logAudit(req.user.id, "ELECTION_UPDATE", `Elección #${id}`);
-
     res.json({ message: "Actualizado correctamente" });
   } catch (err) {
-    console.error(err);
+    console.error("Error actualizando elección:", err);
     res.status(500).json({ message: "Error en el servidor" });
   }
 });
@@ -361,15 +396,12 @@ app.put("/api/admin/elections/update/:id", authRequired, adminOnly, async (req, 
 // ELIMINAR ELECCIÓN
 app.delete("/api/admin/elections/delete/:id", authRequired, adminOnly, async (req, res) => {
   const { id } = req.params;
-
   try {
-    await pool.query("DELETE FROM elections WHERE id=?", [id]);
-
+    await pool.query("DELETE FROM elections WHERE id = ?", [id]);
     await logAudit(req.user.id, "ELECTION_DELETE", `Elección eliminada #${id}`);
-
     res.json({ message: "Elección eliminada" });
   } catch (err) {
-    console.error(err);
+    console.error("Error eliminando elección:", err);
     res.status(500).json({ message: "Error en el servidor" });
   }
 });
@@ -385,25 +417,26 @@ app.get("/api/admin/candidates", authRequired, adminOnly, async (_req, res) => {
     );
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    console.error("Error obteniendo candidatos:", err);
+    res.status(500).json({ message: "Error en el servidor" });
   }
 });
 
 // CREAR CANDIDATO
 app.post("/api/admin/candidates/create", authRequired, adminOnly, async (req, res) => {
-  const { election_id, name, party, bio, photo_url } = req.body;
+  const { election_id, name, party, bio, photo_url } = req.body || {};
+  if (!election_id || !name)
+    return res.status(400).json({ message: "election_id y nombre requeridos" });
 
   try {
     const [result] = await pool.query(
       "INSERT INTO candidates (election_id, name, party, bio, photo_url, created_at) VALUES (?, ?, ?, ?, ?, NOW())",
-      [election_id, name, party, bio, photo_url]
+      [election_id, name, party || null, bio || null, photo_url || null]
     );
-
-    await logAudit(req.user.id, "CANDIDATE_CREATE", `Candidato ${name}`);
-
+    await logAudit(req.user.id, "CANDIDATE_CREATE", `Candidato ${name} (#${result.insertId})`);
     res.status(201).json({ id: result.insertId });
   } catch (err) {
-    console.error(err);
+    console.error("Error creando candidato:", err);
     res.status(500).json({ message: "Error en el servidor" });
   }
 });
@@ -411,19 +444,19 @@ app.post("/api/admin/candidates/create", authRequired, adminOnly, async (req, re
 // EDITAR CANDIDATO
 app.put("/api/admin/candidates/update/:id", authRequired, adminOnly, async (req, res) => {
   const { id } = req.params;
-  const { election_id, name, party, bio, photo_url } = req.body;
+  const { election_id, name, party, bio, photo_url } = req.body || {};
+  if (!election_id || !name)
+    return res.status(400).json({ message: "election_id y nombre requeridos" });
 
   try {
     await pool.query(
       "UPDATE candidates SET election_id=?, name=?, party=?, bio=?, photo_url=? WHERE id=?",
-      [election_id, name, party, bio, photo_url, id]
+      [election_id, name, party || null, bio || null, photo_url || null, id]
     );
-
     await logAudit(req.user.id, "CANDIDATE_UPDATE", `Candidato #${id}`);
-
     res.json({ message: "Candidato actualizado" });
   } catch (err) {
-    console.error(err);
+    console.error("Error actualizando candidato:", err);
     res.status(500).json({ message: "Error en el servidor" });
   }
 });
@@ -431,15 +464,12 @@ app.put("/api/admin/candidates/update/:id", authRequired, adminOnly, async (req,
 // ELIMINAR CANDIDATO
 app.delete("/api/admin/candidates/delete/:id", authRequired, adminOnly, async (req, res) => {
   const { id } = req.params;
-
   try {
-    await pool.query("DELETE FROM candidates WHERE id=?", [id]);
-
+    await pool.query("DELETE FROM candidates WHERE id = ?", [id]);
     await logAudit(req.user.id, "CANDIDATE_DELETE", `Candidato eliminado #${id}`);
-
     res.json({ message: "Eliminado correctamente" });
   } catch (err) {
-    console.error(err);
+    console.error("Error eliminando candidato:", err);
     res.status(500).json({ message: "Error en el servidor" });
   }
 });
@@ -448,34 +478,29 @@ app.delete("/api/admin/candidates/delete/:id", authRequired, adminOnly, async (r
 app.get("/api/admin/users", authRequired, adminOnly, async (_req, res) => {
   try {
     const [rows] = await pool.query(
-      "SELECT id, name, email, role, active FROM users"
+      "SELECT id, name, email, role, active FROM users ORDER BY created_at DESC"
     );
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    console.error("Error obteniendo usuarios:", err);
+    res.status(500).json({ message: "Error en el servidor" });
   }
 });
 
-// ACTIVAR / DESACTIVAR USER
+// ACTIVAR / DESACTIVAR USUARIO
 app.patch("/api/admin/users/:id/status", authRequired, adminOnly, async (req, res) => {
   const { id } = req.params;
-  const { active } = req.body;
-
+  const { active } = req.body || {};
   try {
-    await pool.query("UPDATE users SET active=? WHERE id=?", [
-      active ? 1 : 0,
-      id,
-    ]);
-
+    await pool.query("UPDATE users SET active = ? WHERE id = ?", [active ? 1 : 0, id]);
     await logAudit(
       req.user.id,
       "USER_STATUS",
       `Usuario #${id} -> ${active ? "Activo" : "Inactivo"}`
     );
-
     res.json({ message: "Estado actualizado" });
   } catch (err) {
-    console.error(err);
+    console.error("Error actualizando estado:", err);
     res.status(500).json({ message: "Error en el servidor" });
   }
 });
@@ -492,13 +517,14 @@ app.get("/api/admin/audit", authRequired, adminOnly, async (_req, res) => {
     );
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    console.error("Error obteniendo auditoría:", err);
+    res.status(500).json({ message: "Error en el servidor" });
   }
 });
 
-// ================================================
-//                   SERVER START
-// ================================================
+// ==============================
+//         SERVER START
+// ==============================
 app.listen(PORT, () => {
   console.log(`Servidor backend escuchando en http://localhost:${PORT}`);
 });
